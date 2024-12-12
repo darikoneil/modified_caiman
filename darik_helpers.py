@@ -2,6 +2,10 @@ from pathlib import Path
 import numpy as np
 from exporgo.organization.experiment import Experiment
 from tqdm import tqdm
+import joblib
+from caiman import load
+from caiman.mmapping import save_memmap, save_memmap_join
+from caiman.source_extraction.cnmf import cnmf
 
 
 _TEMPORARY_CAIMAN_DIRECTORY = Path(R"C:\Users\Yuste\caiman_data\temp")
@@ -39,6 +43,7 @@ def memory_map_ndarray(file: Path | str, data: np.ndarray) -> None:
     pixels_per_frame = np.prod(tensor_shape[1:])
     frames = data.shape[0]
     squeezed_shape = (pixels_per_frame, frames)
+    # noinspection PyTypeChecker
     mapped_data = np.memmap(filename=file, dtype=np.float32, mode="w+", shape=squeezed_shape, order="F")
     for idx, page in enumerate(data):
         mapped_data[:, idx] = np.reshape(page,
@@ -65,16 +70,16 @@ def calculate_gsiz(expected_half_size: int, microns_per_pixel: float) -> tuple[i
 
 
 def calculate_max_shift(max_shift_percentage: float, patch_size_in_microns: float, microns_per_pixel: float) \
-        -> tuple[int, int]:
+        -> np.ndarray:
     """
     Calculates the maximum shift in pixels given a percentage of the patch size
     """
     patch_size_in_pixels = convert_microns_to_pixels(patch_size_in_microns, microns_per_pixel)
-    max_shift = round(max_shift_percentage * patch_size_in_pixels)
-    return max_shift, max_shift
+    max_shift = int(round(max_shift_percentage * patch_size_in_pixels))
+    return np.array([max_shift, max_shift], dtype=np.int8)
 
 
-def calculate_patches(patch_size_in_microns: float, microns_per_pixels: float, overlap_percentage: float) \
+def calculate_motion_patches(patch_size_in_microns: float, microns_per_pixels: float, overlap_percentage: float) \
         -> tuple[tuple[int, int], tuple[int, int]]:
     """
     Calculates the number of patches in x and y given a patch size in microns and overlap percentage
@@ -85,6 +90,17 @@ def calculate_patches(patch_size_in_microns: float, microns_per_pixels: float, o
     overlaps = (round(overlap_percentage * patch_size_in_pixels),
                 round(overlap_percentage * patch_size_in_pixels))
     return strides, overlaps
+
+
+def calculate_cnmf_patches(patch_size_in_microns: float, microns_per_pixels: float, expected_neuron_diameter: float) \
+        -> tuple[tuple[int, int], tuple[int, int]]:
+    """
+    Calculates the number of patches in x and y given a patch size in microns and overlap percentage
+    """
+    patch_size_in_pixels = convert_microns_to_pixels(patch_size_in_microns, microns_per_pixels)
+    rf = int(round(patch_size_in_pixels // 2))
+    stride = int(round(convert_microns_to_pixels(expected_neuron_diameter, microns_per_pixels)))
+    return (rf, rf), (stride, stride)
 
 
 def convert_pixels_microns(pixels: int, microns_per_pixel: float) -> float:
@@ -108,17 +124,15 @@ def get_temporary_files() -> list[str]:
     return [str(file) for file in _TEMPORARY_CAIMAN_DIRECTORY.glob("*.mmap")]
 
 
-def get_compiled_file() -> str:
+def get_compiled_file(base_name: str = "memmap_") -> str:
     """
     Gets the compiled file in the caiman data directory
     """
     temporary_files = get_temporary_files()
 
     for file in temporary_files:
-        if "memmap_" in file:
+        if base_name in file:
             return file
-
-    raise FileNotFoundError("Compiled file not found")
 
 
 def get_imaging_files(experiment: Experiment) -> list[str]:
@@ -129,3 +143,24 @@ def get_imaging_files(experiment: Experiment) -> list[str]:
 def get_mapped_files(experiment: Experiment) -> list[str]:
     mapped_files = [str(file) for file in experiment.find("*images0*.mmap")]
     return mapped_files
+
+
+def produce_corrected_compiled_file(results: cnmf,
+                                    imaging_files: list[str],
+                                    delete_originals: bool = False) -> str:
+    shifts = results.estimates.shifts
+    base_name = Path(imaging_files[0]).stem.split("_")[0]
+    start_idx = 0
+    end_idx = 0
+    new_files = []
+    for file in tqdm(imaging_files, total=len(imaging_files), desc="Saving corrected memmap files", colour="yellow"):
+        frames = int(file.split("frames_")[-1].split(".")[0])
+        end_idx += frames
+        new_files.append(save_memmap([file], base_name=base_name, xy_shifts=shifts[start_idx:end_idx], order="C"))
+        start_idx = end_idx
+        if delete_originals:
+            Path(file).unlink()
+
+    compiled_name = save_memmap_join(new_files, base_name="compiled_" + base_name)
+    return compiled_name
+
