@@ -716,7 +716,7 @@ class CNMFParams(object):
             'init_iter': init_iter,
             'kernel': None,           # user specified template for greedyROI
             'lambda_gnmf' :1,         # regularization weight for graph NMF
-            'maxIter': 5,             # number of HALS iterations
+            'maxIter': 5,             # number of HALS iteratnions
             'max_iter_snmf': 500,
             'method_init': method_init,    # can be greedy_roi, corr_pnr sparse_nmf, local_NMF
             'min_corr': min_corr,
