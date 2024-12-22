@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
+from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict, ValidationError
 from typing import Any, Literal, Callable
 from os import path
 from dataclasses import dataclass
@@ -8,7 +8,8 @@ from caiman.utils.utils import get_caiman_version
 from pkg_resources import get_distribution
 from types import MappingProxyType
 import numpy as np
-
+from functools import wraps
+from psutil import cpu_count
 
 #def get_distribution(*args, **kwargs) -> object:
 #    class MOCKCAIMAN:
@@ -25,7 +26,7 @@ class CONSTANTS:
     ----------
     SUPPORTED_FILE_EXTENSIONS: tuple[str]
         caiman's supported file extensions
-        
+
     MODEL_CONFIG: MappingProxyType
         pydantic model configuration (read-only, must copy to modify)
     """
@@ -43,6 +44,29 @@ class CONSTANTS:
         # do not validate fields when they are assigned, set to True in the post-initialization method
         "validate_assignment": False, 
     })
+
+
+def _consistency_validator(field: str) -> Callable:
+    """
+    Decorator to tag a method as a consistency validator. This decorator is used to tag methods that validate the
+    consistency of the fields in the model with respect to other models. This tag indicates a collection of validators
+    that ought to be called by the global model validator :class:`CaimanParameters` after all other validators have
+    been called. All consistency validators must take :class:`DataParameters` as an argument.
+
+    Parameters
+    ----------
+    field: str
+        name of the field that the method validates
+
+    Returns
+    -------
+    Callable
+    """
+    @wraps
+    def tagged_method(func: Callable) -> Callable:
+        func.consistency_validator = field
+        return func
+    return tagged_method
 
 
 def _get_hash_latest_commit() -> str:
@@ -115,7 +139,7 @@ class _CaimanParameterModel(BaseModel):
 
 class DataParameters(_CaimanParameterModel):
     """
-    General params describing the dataset like dimensions, decay time, filename and framerate
+    General params describing the dataset
 
     Attributes
     ----------
@@ -142,7 +166,7 @@ class DataParameters(_CaimanParameterModel):
     fnames: tuple[str] | None = None
 
     #: dimension of the FOV in pixels
-    dims: tuple[int, ...] | None = None
+    dims: tuple[int, int] | None = None
 
     #: number of total frames
     frames: int | None = None
@@ -154,7 +178,7 @@ class DataParameters(_CaimanParameterModel):
     decay_time: float = Field(default=1.0, gt=0.0)
 
     #: spatial resolution of FOV in pixels per um
-    dxy: tuple[float, ...] = (1.0, 1.0)
+    dxy: tuple[float, float] = (1.0, 1.0)
 
     #: if loading from hdf5 name of the variable to load
     var_name_hdf5: str | None = None
@@ -165,7 +189,7 @@ class DataParameters(_CaimanParameterModel):
     #: hash of last commit in the caiman repo. Please do not override this.
     last_commit: str = Field(default_factory=_get_hash_latest_commit, frozen=True)
 
-    # whether to short circuit the validation process for the movies
+    # whether to short circuit the validation process for the movies (they can be expensive to validate)
     _short_circuit = hash("caiman")
 
     @field_validator("fnames", mode="before")
@@ -184,6 +208,17 @@ class DataParameters(_CaimanParameterModel):
         -------
         list of str
             list of complete paths to files that need to be processed
+
+        Raises
+        ------
+        ValidationError
+            if fnames is not a list of strings whose length is greater than 0
+        Validation Error
+            if any member of fnames does not exist
+        ValidationError
+            if there is more than one file extension in fnames
+        ValidationError
+            if any file extensions are not a supported format.
         """
 
         if fnames is not None:
@@ -225,8 +260,8 @@ class DataParameters(_CaimanParameterModel):
 
         Raises
         ------
-        AssertionError
-            if any value in dims is less than or equal to 0
+        ValidationError
+            if any value in dims is less than or equal to 0 if dims is not None
         """
         if dims is not None:
             assert all([value > 0 for value in dims]), "All values in dims must be greater than 0"
@@ -250,8 +285,8 @@ class DataParameters(_CaimanParameterModel):
 
         Raises
         ------
-        AssertionError
-            if frames is less than or equal to 0
+        ValidationError
+            if frames is less than or equal to 0 if frames is not None
         """
         if frames is not None:
             assert frames > 0, "frames must be greater than 0"
@@ -275,7 +310,7 @@ class DataParameters(_CaimanParameterModel):
 
         Raises
         ------
-        AssertionError
+        ValidationError
             if any value in dxy is less than or equal to 0
         """
         assert all([value > 0.0 for value in dxy]), "All values in dxy must be greater than 0"
@@ -289,9 +324,9 @@ class DataParameters(_CaimanParameterModel):
 
         Raises
         ------
-        AssertionError
+        ValidationError
             if the dimensions of the FOV are not consistent across all movies
-        AssertionError
+        ValidationError
             if the number of frames in all movies are not consistent
         """
 
@@ -376,7 +411,6 @@ class PatchParameters(BaseModel):
 
     p_tsub: float, default: 2
         Temporal downsampling factor
-
     """
 
     #: model configuration
@@ -407,7 +441,7 @@ class PatchParameters(BaseModel):
     only_init: bool = True
 
     #: order of AR dynamics when processing within a patch
-    p_patch: int = Field(0, ge=0, le=2)
+    p_patch: Literal[0, 1, 2] = 0
 
     #: Whether to remove (very) bad quality components during patch processing
     remove_very_bad_comps: bool = True
@@ -426,6 +460,90 @@ class PatchParameters(BaseModel):
 
     # Temporal downsampling factor
     p_tsub: int = Field(2, ge=1)
+
+    @field_validator("n_processes", mode="after")
+    @classmethod
+    def validate_n_processes(cls, n_processes: int) -> int:
+        """
+        Validate n_processes is less than or equal to the number of available CPUs.
+
+        Parameters
+        ----------
+        n_processes: int
+            Number of processes used for processing patches in parallel
+
+        Returns
+        -------
+        int
+
+        Raises
+        ------
+        ValidationError
+            if n_processes is greater than the number of available CPUs
+        """
+        assert n_processes <= cpu_count(), \
+            (f"n_processes must be less than or equal to the number of available CPUs\n"
+             f"{n_processes=}, {cpu_count()=}")
+        return n_processes
+
+    @_consistency_validator("border_pix")
+    def validate_border_pix(self, data_parameters: DataParameters) -> None:
+        """
+        Validate border_pix is less than 1/2th smallest dimension of the FOV.
+
+        Parameters
+        ----------
+        data_parameters: DataParameters
+            data parameters to validate with respect to
+
+        Raises
+        ------
+        ValidationError
+            if border_pix is greater than or equal to the minimum dimension of the FOV
+        """
+        try:
+            assert self.border_pix < min(data_parameters.dims) / 2, \
+                "border_pix must be less than the minimum dimension of the FOV"
+        except AssertionError as exc:
+            raise ValidationError(exc)
+
+    @_consistency_validator("rf")
+    def validate_rf(self, data_parameters: DataParameters) -> None:
+        """
+        Validate rf is less than or equal to 1/2th the minimum dimension of the FOV and
+        that there is exactly one rf value for each dimension of the FOV.
+
+        Parameters
+        ----------
+        data_parameters: DataParameters
+            data parameters to validate with respect to
+
+        Raises
+        ------
+        ValidationError
+            if rf is greater than or equal to the 1/2th the minimum dimension of the FOV
+        """
+        try:
+            if isinstance(self.rf, int):
+                self.rf = (self.rf, self.rf)
+            assert self.rf < min(data_parameters.dims) / 2, \
+                "rf must be less than the minimum dimension of the FOV"
+        except AssertionError as exc:
+            raise ValidationError(exc)
+
+    @model_validator(mode="after")
+    def validate_rf_stride_consistent(self) -> "PatchParameters":
+        """
+        Validate that the stride is less than or equal to the rf.
+
+        Raises
+        ------
+        ValidationError
+            if stride is greater than or equal to rf
+        """
+        if self.rf is not None and self.stride is not None:
+            assert all([self.stride < rf for rf in self.rf]), "stride must be less than rf"
+        return self
 
 
 class PreprocessParameters(BaseModel):
